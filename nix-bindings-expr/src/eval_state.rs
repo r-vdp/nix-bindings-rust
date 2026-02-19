@@ -143,7 +143,7 @@ use nix_bindings_util::string_return::{
     callback_get_result_string, callback_get_result_string_data,
 };
 use nix_bindings_util::{check_call, check_call_opt_key, result_string_init};
-use std::ffi::{c_char, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::iter::FromIterator;
 use std::os::raw::c_uint;
 use std::ptr::{null, null_mut, NonNull};
@@ -198,6 +198,10 @@ impl EvalStateWeak {
 
 struct EvalStateRef {
     eval_state: NonNull<raw::EvalState>,
+    /// Whether we own the EvalState and should free it on drop.
+    /// When `false`, the EvalState is borrowed (e.g., from a Nix builtin callback)
+    /// and must not be freed by us.
+    owned: bool,
 }
 impl EvalStateRef {
     /// Returns a raw pointer to the underlying EvalState.
@@ -211,8 +215,10 @@ impl EvalStateRef {
 }
 impl Drop for EvalStateRef {
     fn drop(&mut self) {
-        unsafe {
-            raw::state_free(self.eval_state.as_ptr());
+        if self.owned {
+            unsafe {
+                raw::state_free(self.eval_state.as_ptr());
+            }
         }
     }
 }
@@ -335,6 +341,7 @@ impl EvalStateBuilder {
                 eval_state: NonNull::new(eval_state).unwrap_or_else(|| {
                     panic!("nix_state_create returned a null pointer without an error")
                 }),
+                owned: true,
             }),
             store: self.store.clone(),
             context,
@@ -356,6 +363,14 @@ pub struct EvalState {
     store: Store,
     pub(crate) context: Context,
 }
+
+// TODO: does this make sense?
+impl From<*mut raw::EvalState> for EvalState {
+    fn from(ptr: *mut raw::EvalState) -> Self {
+        EvalState::from_borrowed_pointer(ptr)
+    }
+}
+
 impl EvalState {
     /// Creates a new EvalState with basic configuration.
     ///
@@ -364,6 +379,17 @@ impl EvalState {
         EvalStateBuilder::new(store)?
             .lookup_path(lookup_path)?
             .build()
+    }
+
+    fn from_borrowed_pointer(value: *mut raw::EvalState) -> Self {
+        EvalState {
+            eval_state: Arc::new(EvalStateRef {
+                eval_state: NonNull::new(value).expect("raw eval_state pointer is null"),
+                owned: false,
+            }),
+            context: Context::new(),
+            store: Store::open(None, Vec::new()).expect("the store could not be opened"),
+        }
     }
 
     /// Returns a raw pointer to the raw Nix C API EvalState.
@@ -859,6 +885,13 @@ impl EvalState {
         };
         r
     }
+    fn get_path_string(&mut self, value: &Value) -> Result<String> {
+        let cstr = unsafe {
+            let r = check_call!(raw::get_path_string(&mut self.context, value.raw_ptr()))?;
+            CStr::from_ptr(r)
+        };
+        Ok(cstr.to_str()?.to_owned())
+    }
     /// Extracts a string value from a [string][`ValueType::String`] Nix value.
     ///
     /// Forces [evaluation](https://nix.dev/manual/nix/latest/language/evaluation.html) and verifies the value is a string.
@@ -875,6 +908,13 @@ impl EvalState {
             bail!("expected a string, but got a {:?}", t);
         }
         self.get_string(value)
+    }
+    pub fn require_path_string(&mut self, value: &Value) -> Result<String> {
+        let t = self.value_type(value)?;
+        if t != ValueType::Path {
+            bail!("expected a path, but got a {:?}", t);
+        }
+        self.get_path_string(value)
     }
     /// Realises a [string][`ValueType::String`] Nix value with context information.
     ///
@@ -1929,7 +1969,7 @@ mod tests {
                             }}
                     a path: ${builtins.toFile "just-a-file" "ooh file good"}
                     a derivation path by itself: ${
-                        builtins.unsafeDiscardOutputDependency 
+                        builtins.unsafeDiscardOutputDependency
                             (derivation {
                                 name = "not-actually-built-yet";
                                 system = builtins.currentSystem;

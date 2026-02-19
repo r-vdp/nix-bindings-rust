@@ -5,6 +5,7 @@ use nix_bindings_util::string_return::{
     callback_get_result_string, callback_get_result_string_data,
 };
 use nix_bindings_util::{check_call, result_string_init};
+#[cfg(nix_at_least = "2.33.0pre")]
 use nix_bindings_util_sys as raw_util;
 #[cfg(nix_at_least = "2.33.0pre")]
 use std::collections::BTreeMap;
